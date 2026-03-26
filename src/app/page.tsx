@@ -1,11 +1,17 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import SmoothScroll from "@/components/SmoothScroll";
 import ScrollVideo from "@/components/ScrollVideo";
 import VideoOverlays from "@/components/VideoOverlays";
-import KeyframeEditor, { useKeyframes } from "@/components/KeyframeEditor";
+import { useKeyframes } from "@/components/KeyframeEditor";
 import { useCallback, useState } from "react";
-import { type Keyframe } from "@/components/KeyframeEditor";
+import { type Keyframe } from "@/lib/keyframes";
+
+const KeyframeEditor = dynamic(
+  () => import("@/components/KeyframeEditor"),
+  { ssr: false }
+);
 
 function PageContent() {
   const { keyframes, updateKeyframes } = useKeyframes();
@@ -29,7 +35,10 @@ function PageContent() {
       <main>
         <ScrollVideo keyframes={keyframes} frameOverride={frameOverride}>
           {(progress: number, frame: number) => {
-            if (progress !== currentScroll) {
+            if (
+              process.env.NODE_ENV === "development" &&
+              progress !== currentScroll
+            ) {
               requestAnimationFrame(() => {
                 setCurrentScroll(progress);
                 setCurrentFrame(frame);

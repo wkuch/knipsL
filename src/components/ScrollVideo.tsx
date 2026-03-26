@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useCallback, useState } from "react";
-import { type Keyframe, applyKeyframes } from "./KeyframeEditor";
+import { type Keyframe, applyKeyframes } from "@/lib/keyframes";
 
 const TOTAL_FRAMES = 1057;
 const SCROLL_HEIGHT_VH = 2500; // Apple-style: very long scroll, dramatic pacing
@@ -18,6 +18,7 @@ interface ScrollVideoProps {
 
 export default function ScrollVideo({ children, keyframes, frameOverride }: ScrollVideoProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const framesRef = useRef<(ImageBitmap | HTMLImageElement | null)[]>(
     new Array(TOTAL_FRAMES).fill(null)
@@ -47,10 +48,10 @@ export default function ScrollVideo({ children, keyframes, frameOverride }: Scro
 
   // Draw frame, with fallback to nearest loaded frame if target isn't ready
   const drawFrame = useCallback((fi: number) => {
+    const ctx = ctxRef.current;
+    if (!ctx) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
 
     // Find the requested frame, or fall back to nearest loaded frame
     let frame = framesRef.current[fi];
@@ -156,6 +157,7 @@ export default function ScrollVideo({ children, keyframes, frameOverride }: Scro
   }, [drawFrame]);
 
   // Handle scroll -> target frame mapping
+  const lastProgressRef = useRef(0);
   const handleScroll = useCallback(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -170,7 +172,15 @@ export default function ScrollVideo({ children, keyframes, frameOverride }: Scro
       scrollTop > lastScrollTopRef.current ? "down" : "up";
     lastScrollTopRef.current = scrollTop;
 
-    setProgress(rawProgress);
+    // Only trigger React re-render when progress changes meaningfully
+    // and only while ScrollIndicator is still visible (< 3%)
+    if (
+      Math.abs(rawProgress - lastProgressRef.current) > 0.001 &&
+      (rawProgress < 0.03 || lastProgressRef.current < 0.03)
+    ) {
+      lastProgressRef.current = rawProgress;
+      setProgress(rawProgress);
+    }
 
     let fi: number;
     if (keyframesRef.current && keyframesRef.current.length >= 2) {
@@ -194,6 +204,7 @@ export default function ScrollVideo({ children, keyframes, frameOverride }: Scro
       canvas.height = window.innerHeight * dpr;
       canvas.style.width = `${window.innerWidth}px`;
       canvas.style.height = `${window.innerHeight}px`;
+      ctxRef.current = canvas.getContext("2d");
       drawFrame(drawnFrameRef.current >= 0 ? drawnFrameRef.current : 0);
     };
 
@@ -202,12 +213,26 @@ export default function ScrollVideo({ children, keyframes, frameOverride }: Scro
     return () => window.removeEventListener("resize", resize);
   }, [drawFrame]);
 
-  // Frame loading with directional priority
+  // Frame loading: viewport-window strategy with memory management
   useEffect(() => {
     let cancelled = false;
+    const VIEWPORT_WINDOW = 100; // frames ahead/behind to keep loaded
+    const MAX_LOADED = 250; // max frames in memory
+    const SKELETON_STEP = 24; // one frame per ~second for skeleton
+    const skeletonIndices = new Set<number>();
+    const loadedIndices = new Set<number>();
+
+    // Build skeleton frame set (never evicted)
+    for (let i = 0; i < TOTAL_FRAMES; i += SKELETON_STEP) {
+      skeletonIndices.add(i);
+    }
+    skeletonIndices.add(TOTAL_FRAMES - 1);
 
     const loadFrame = async (index: number): Promise<void> => {
-      if (cancelled || framesRef.current[index]) return;
+      if (cancelled || framesRef.current[index]) {
+        if (framesRef.current[index]) loadedIndices.add(index);
+        return;
+      }
 
       return new Promise((resolve) => {
         const img = new Image();
@@ -222,10 +247,10 @@ export default function ScrollVideo({ children, keyframes, frameOverride }: Scro
           } catch {
             framesRef.current[index] = img;
           }
+          loadedIndices.add(index);
           loadedCountRef.current++;
           setLoadProgress(loadedCountRef.current / TOTAL_FRAMES);
 
-          // Draw immediately if this is the frame we need right now
           if (index === Math.round(displayFrameRef.current)) {
             drawFrame(index);
           }
@@ -236,36 +261,96 @@ export default function ScrollVideo({ children, keyframes, frameOverride }: Scro
       });
     };
 
-    const loadAll = async () => {
-      // Phase 1: Load first 10 frames for instant display
-      for (let i = 0; i < Math.min(10, TOTAL_FRAMES); i++) {
-        if (cancelled) return;
-        await loadFrame(i);
-      }
+    // Evict frames that are far from the current position
+    const evictDistant = (currentFrame: number) => {
+      if (loadedIndices.size <= MAX_LOADED) return;
 
-      // Phase 2: Load keyframes (every 24th frame = 1 per second)
-      // This gives a rough version of the whole video fast
-      for (let i = 0; i < TOTAL_FRAMES; i += 24) {
-        if (cancelled) return;
-        await loadFrame(i);
-      }
+      const sorted = [...loadedIndices].sort(
+        (a, b) => Math.abs(b - currentFrame) - Math.abs(a - currentFrame)
+      );
 
-      // Phase 3: Fill in remaining frames in batches
-      const batchSize = 15;
-      for (let i = 0; i < TOTAL_FRAMES; i += batchSize) {
-        if (cancelled) break;
-        const batch = [];
-        for (let j = i; j < Math.min(i + batchSize, TOTAL_FRAMES); j++) {
-          batch.push(loadFrame(j));
+      const toEvict = sorted.slice(0, loadedIndices.size - MAX_LOADED);
+      for (const idx of toEvict) {
+        // Never evict skeleton frames or bootstrap frames
+        if (skeletonIndices.has(idx) || idx < 10) continue;
+        const frame = framesRef.current[idx];
+        if (frame instanceof ImageBitmap) {
+          frame.close();
         }
-        await Promise.all(batch);
+        framesRef.current[idx] = null;
+        loadedIndices.delete(idx);
+        loadedCountRef.current--;
       }
     };
 
-    loadAll();
+    // Load frames in a window around the current position
+    const loadViewportWindow = async () => {
+      const center = Math.round(targetFrameRef.current);
+      const dir = scrollDirectionRef.current;
+      const ahead = dir === "down" ? VIEWPORT_WINDOW : Math.round(VIEWPORT_WINDOW * 0.4);
+      const behind = dir === "down" ? Math.round(VIEWPORT_WINDOW * 0.4) : VIEWPORT_WINDOW;
+
+      const start = Math.max(0, center - behind);
+      const end = Math.min(TOTAL_FRAMES - 1, center + ahead);
+
+      // Load in batches of 20
+      const batchSize = 20;
+      for (let i = start; i <= end; i += batchSize) {
+        if (cancelled) return;
+        const batch = [];
+        for (let j = i; j < Math.min(i + batchSize, end + 1); j++) {
+          if (!framesRef.current[j]) {
+            batch.push(loadFrame(j));
+          }
+        }
+        if (batch.length > 0) await Promise.all(batch);
+      }
+
+      evictDistant(center);
+    };
+
+    const bootstrap = async () => {
+      // Phase 1: Load first 10 frames in parallel for instant display
+      await Promise.all(
+        Array.from({ length: Math.min(10, TOTAL_FRAMES) }, (_, i) =>
+          loadFrame(i)
+        )
+      );
+      if (cancelled) return;
+
+      // Phase 2: Load skeleton keyframes for full-range fallback
+      const skeletonBatch = [...skeletonIndices].filter(
+        (i) => !framesRef.current[i]
+      );
+      const batchSize = 20;
+      for (let i = 0; i < skeletonBatch.length; i += batchSize) {
+        if (cancelled) return;
+        await Promise.all(
+          skeletonBatch.slice(i, i + batchSize).map((idx) => loadFrame(idx))
+        );
+      }
+      if (cancelled) return;
+
+      // Phase 3: Load viewport window around current position, then keep updating
+      await loadViewportWindow();
+    };
+
+    bootstrap();
+
+    // Continuously load frames around viewport as user scrolls
+    let lastLoadedCenter = -1;
+    const viewportInterval = setInterval(() => {
+      if (cancelled) return;
+      const center = Math.round(targetFrameRef.current);
+      if (Math.abs(center - lastLoadedCenter) > 10) {
+        lastLoadedCenter = center;
+        loadViewportWindow();
+      }
+    }, 500);
 
     return () => {
       cancelled = true;
+      clearInterval(viewportInterval);
       framesRef.current.forEach((frame) => {
         if (frame instanceof ImageBitmap) {
           frame.close();
